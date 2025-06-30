@@ -39,7 +39,7 @@ from .codegen.common import BackendFeature, get_scheduling_for_device, Kernel
 from .comm_analysis import estimate_nccl_collective_runtime
 from .dependencies import Dep, MemoryDep, StarDep, WeakDep
 from .exc import GPUTooOldForTriton, TritonMissing
-from .fx_utils import count_flops_fx, countable_fx
+from .fx_utils import count_flops_fx
 from .ir import (
     get_device_type,
     GraphPartitionSignature,
@@ -790,12 +790,12 @@ class BaseSchedulerNode:
         fx_node = self.node.get_origin_node()
         if fx_node is None:
             return None
-        if not countable_fx(fx_node):
-            return None
 
         flops = count_flops_fx(fx_node)
+        if flops is None:
+            return None
 
-        resolved_flops = V.graph.sizevars.size_hints((flops,), fallback=0)[0]
+        resolved_flops = V.graph.sizevars.size_hint(flops, fallback=0)
         counters["inductor"]["flop_count"] += resolved_flops
         return resolved_flops
 
@@ -1187,6 +1187,17 @@ class SchedulerNode(BaseSchedulerNode):
         return var_ranges
 
     def codegen(self, index_vars: Sequence[Sequence[sympy.Expr]]) -> None:
+        """
+        Generate code for this node using the provided index variables.
+
+        This method sets up the appropriate context for code generation, including
+        simplifying indexing expressions based on the variable ranges, and then
+        calls the node's body function with the index variables.
+
+        Args:
+            index_vars: A sequence of sequences of sympy expressions representing
+                        the index variables for each dimension of the computation.
+        """
         var_ranges = self.ranges_from_index_vars(index_vars)
         try:
             with (
@@ -2804,6 +2815,20 @@ class Scheduler:
             for n in node_list
         )
 
+    def _template_upcast(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> bool:
+        # Check if fusing an upcast onto a Triton template. If so, we want to benchmark
+        # the fusion to make sure that shared memory requirements are still met
+        return (
+            isinstance(node1.get_template_node(), ir.TritonTemplateBuffer)
+            and node1.node is not None
+            and node2.node is not None
+            and hasattr(node1.node, "get_dtype")
+            and hasattr(node2.node, "get_dtype")
+            and node1.node.get_dtype().itemsize < node2.node.get_dtype().itemsize
+        )
+
     def speedup_by_fusion(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> Union[bool, Callable[[], bool]]:
@@ -2817,7 +2842,12 @@ class Scheduler:
             and isinstance(n.get_template_node(), ir.MultiTemplateBuffer)
             for n in (node1, node2)
         )
-        if not config.benchmark_fusion and not is_multi_template:
+
+        if (
+            not self._template_upcast(node1, node2)
+            and not config.benchmark_fusion
+            and not is_multi_template
+        ):
             return True
 
         if (
@@ -3048,7 +3078,10 @@ class Scheduler:
 
                 except NoTritonConfigsError:
                     return False
-
+                except RuntimeError as e:
+                    if "out of resource" in str(e):
+                        return False
+                    raise
                 except CompilationError as e:
                     if "Loop-carried variable" in str(e):
                         return True

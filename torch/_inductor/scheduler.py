@@ -54,6 +54,7 @@ from .memory import MemoryPlanningInfoForBuffer, MemoryPlanningInfoForNode
 from .runtime.runtime_utils import green_text, red_text
 from .sizevars import SimplifyIndexing
 from .utils import (
+    _unstable_customized_partition_wrapper,
     cache_on_self,
     cmp,
     device_need_guard,
@@ -237,6 +238,13 @@ class BaseSchedulerNode:
             buf.get_name(): buf for buf in self.outputs
         }
 
+        # mutation_renames for the current node. Due to potential
+        # more mutations happening later, this can be different
+        # to Scheduler.mutation_renames. Also this dict should be small
+        # since only mutation information relevant to the deps for this
+        # node is stored here.
+        self.mutation_renames: dict[str, str] = {}
+
     def __repr__(self) -> str:
         return f"{type(self).__name__}(name={self.get_name()!r})"
 
@@ -300,7 +308,12 @@ class BaseSchedulerNode:
         return
 
     def update_mutated_names(self, renames: dict[str, str]) -> None:
-        self.set_read_writes(self.read_writes.rename(renames))
+        self.mutation_renames = {
+            name: renames[name]
+            for name in (dep.name for dep in self.read_writes.reads_and_writes())
+            if name in renames
+        }
+        self.set_read_writes(self.read_writes.rename(self.mutation_renames))
 
     def add_fake_dep(self, dep: Dep) -> None:
         self.set_read_writes(self.read_writes.with_read(dep))
@@ -605,12 +618,15 @@ class BaseSchedulerNode:
             out_lines.append(op_info_str)
             if "stack_trace" in o.meta:
                 stack_trace = f"{o.meta['stack_trace']}"
-                stack_trace_last_line = stack_trace.split("|")[-1]
+                stack_trace_last_line = stack_trace.rsplit("|", maxsplit=1)[-1]
                 out_lines.append(
                     "#pragma CMT "
                     + stack_trace_last_line.replace("{", "{{")
                     .replace("}", "}}")
                     .replace("\n", "\\")
+                    .replace(
+                        "\\", "\\\\"
+                    )  # For windows safe path, avoid for example \x, \U.
                 )
                 out_lines.append("#pragma CMT END ORIGIN")
                 out_lines.append("")
@@ -1078,7 +1094,9 @@ class SchedulerNode(BaseSchedulerNode):
         self.set_read_writes(
             dependencies.extract_read_writes(
                 self._body, *self._sizes, normalize=normalize
-            ).with_read(fake_deps)
+            )
+            .with_read(fake_deps)
+            .rename(self.mutation_renames)
         )
 
         self.pointwise_read_writes.clear_cache(self)
@@ -1099,6 +1117,23 @@ class SchedulerNode(BaseSchedulerNode):
         self._sizes = self._body.sizes
 
         self.refresh_dependencies(normalize=False, need_clear_tiling_cache=True)
+
+    def expand_dimension_for_pointwise_node(
+        self, dimension: int, new_range: int
+    ) -> None:
+        assert isinstance(self.node, (ir.ComputedBuffer, ir.TemplateBuffer))
+
+        self._body = self._body.expand_dimension_for_pointwise_node(
+            dimension, new_range
+        )
+        self._sizes = self._body.sizes
+
+        device = self.node.get_device_or_error()
+        group_fn = self.scheduler.get_backend(device).group_fn
+        self.group = (device, group_fn(self._sizes))
+
+        # Need normalize the prefix name to facilitate finding common dependencies
+        self.refresh_dependencies(normalize=True, need_clear_tiling_cache=True)
 
     def merge_loops(self) -> None:
         self._body = self._body.merge_loops()
@@ -1275,6 +1310,13 @@ class SchedulerNode(BaseSchedulerNode):
                         else (node.args[1] if len(node.args) >= 2 else "")
                     )
         return buffers_store_as_atomic_add
+
+    @cache_on_self
+    def has_side_effects(self) -> bool:
+        # self._body is None sometimes that's why this check was added
+        if self._body is not None and self._body.has_op("device_assert_async"):
+            return True
+        return super().has_side_effects()
 
 
 def refresh_group_node_dependencies(
@@ -1544,6 +1586,12 @@ class FusedSchedulerNode(BaseSchedulerNode):
             log.warning("Ignoring error in debug_str()", exc_info=True)
 
         return buf.getrawvalue().rstrip()
+
+    @cache_on_self
+    def has_side_effects(self) -> bool:
+        if self.snodes is not None:
+            return any(node.has_side_effects() for node in self.snodes)
+        return super().has_side_effects()
 
 
 class ForeachKernelSchedulerNode(FusedSchedulerNode):
@@ -2073,6 +2121,7 @@ class Scheduler:
         )
 
         self.nodes = [self.create_scheduler_node(n) for n in nodes]
+        self.current_node: Optional[BaseSchedulerNode] = None
         self.update_zero_dim_cpu_tensor()
         # some new constants could have been created above
         self.available_buffer_names.update(V.graph.constants.keys())
@@ -2159,6 +2208,12 @@ class Scheduler:
                 OrderedSet(V.graph.get_output_names()),
             )
         if config.reorder_for_compute_comm_overlap:
+            if not config.reorder_for_peak_memory:
+                from .memory import assign_memory_planning_info_for_scheduler_buffers
+
+                assign_memory_planning_info_for_scheduler_buffers(
+                    self.nodes, self.name_to_buf
+                )
             from torch._logging import trace_structured
 
             trace_structured(
@@ -2179,11 +2234,18 @@ class Scheduler:
             self.nodes = comms.reorder_compute_and_comm_for_overlap(self.nodes)
         self.process_grouped_nodes()
 
-        if torch._inductor.config.graph_partition:
+        if (
+            torch._inductor.config.graph_partition
+            and torch._inductor.config.triton.cudagraphs
+        ):
             self.nodes = self.maybe_reorder_for_minimizing_partition(self.nodes)
             self.nodes = self.reorder_for_partition_with_simple_dependency(self.nodes)
 
         self.compute_last_usage()
+
+        if torch._inductor.config.test_configs.track_memory_lifecycle:
+            self.insert_memory_check_nodes()
+
         log_ir_post_fusion(self.nodes)
         V.debug.graph_diagram(self.nodes)
         self.debug_draw_graph()
@@ -2389,11 +2451,11 @@ class Scheduler:
                     for fs in s.free_symbols:
                         unbacked_symbol_to_origin_node[fs] = None
 
+        has_non_input_unbacked_defs = False
         for node in self.nodes:
-            log.debug("scheduling %s", node.node)
+            assert node.node is not None
             # unbacked symbols don't follow ordinary buffer dependencies, so
             # we track their def/uses separately
-            assert node.node is not None
             unbacked_symbol_defs = sorted(
                 node.node.get_unbacked_symbol_defs(), key=lambda x: x.name
             )
@@ -2402,20 +2464,28 @@ class Scheduler:
                 # Pick the first definer as canonical.  There may be multiple
                 # because if a MultiOutputLayout buffer propagates an unbacked
                 # symint to multiple outputs, they will all claim to def it.
+                has_non_input_unbacked_defs = True
                 if s not in unbacked_symbol_to_origin_node:
                     unbacked_symbol_to_origin_node[s] = node.get_name()
 
-            unbacked_symbol_uses = sorted(
-                node.node.get_free_symbol_uses(unbacked_only=True), key=lambda x: x.name
-            )
-            # if a kernel takes unbacked symints, register dependencies
-            for s in unbacked_symbol_uses:
-                assert s in unbacked_symbol_to_origin_node, (
-                    f"{s} not in {unbacked_symbol_to_origin_node}"
+        for node in self.nodes:
+            log.debug("scheduling %s", node.node)
+
+            if has_non_input_unbacked_defs:
+                assert node.node is not None
+
+                unbacked_symbol_uses = sorted(
+                    node.node.get_free_symbol_uses(unbacked_only=True),
+                    key=lambda x: x.name,
                 )
-                if (r := unbacked_symbol_to_origin_node[s]) is not None:
-                    for buf in self.name_to_node[r].get_outputs():
-                        node.add_fake_dep(StarDep(buf.get_name()))
+                # if a kernel takes unbacked symints, register dependencies
+                for s in unbacked_symbol_uses:
+                    assert s in unbacked_symbol_to_origin_node, (
+                        f"{s} not in {unbacked_symbol_to_origin_node}"
+                    )
+                    if (r := unbacked_symbol_to_origin_node[s]) is not None:
+                        for buf in self.name_to_node[r].get_outputs():
+                            node.add_fake_dep(StarDep(buf.get_name()))
 
             if (
                 len(node.read_writes.writes) == 1
@@ -2470,17 +2540,20 @@ class Scheduler:
             add_user(buf_name, OutputNode(StarDep(buf_name)))
 
         # make sure unbacked symints aren't dead-code-eliminated
-        for out in V.graph.graph_outputs:
-            for s in out.get_free_symbol_uses(unbacked_only=True):
-                assert s in unbacked_symbol_to_origin_node, (
-                    f"{s} not in {unbacked_symbol_to_origin_node.keys()}"
-                )
-                if r := unbacked_symbol_to_origin_node[s]:
-                    for buf_name in self.name_to_node[r].get_buffer_names():
-                        log.debug(
-                            "scheduling output %s for unbacked symint %s", buf_name, s
-                        )
-                        add_user(buf_name, OutputNode(StarDep(buf_name)))
+        if has_non_input_unbacked_defs:
+            for out in V.graph.graph_outputs:
+                for s in out.get_free_symbol_uses(unbacked_only=True):
+                    assert s in unbacked_symbol_to_origin_node, (
+                        f"{s} not in {unbacked_symbol_to_origin_node.keys()}"
+                    )
+                    if r := unbacked_symbol_to_origin_node[s]:
+                        for buf_name in self.name_to_node[r].get_buffer_names():
+                            log.debug(
+                                "scheduling output %s for unbacked symint %s",
+                                buf_name,
+                                s,
+                            )
+                            add_user(buf_name, OutputNode(StarDep(buf_name)))
 
         # make sure input mutation isn't dead-code-eliminated
         for name in self.mutation_renames:
@@ -2517,6 +2590,83 @@ class Scheduler:
         str = logbuf.getrawvalue().rstrip()
         compute_dependencies_log.debug("BUFFER USER LIST\n")
         compute_dependencies_log.debug("===== AFTER SCHEDULING =====\n%s", str)
+
+    def insert_memory_check_nodes(self) -> None:
+        from .memory import (
+            assign_memory_planning_info_for_scheduler_buffers,
+            compute_memory_timeline,
+            FreeableInputBuffer,
+            get_freeable_input_buf,
+        )
+
+        graph_inputs: OrderedSet[str] = OrderedSet(V.graph.graph_inputs.keys())
+        name_to_freeable_input_buf: dict[str, FreeableInputBuffer] = (
+            get_freeable_input_buf(self.nodes, graph_inputs)
+        )
+
+        if not torch._inductor.config.reorder_for_peak_memory:
+            assign_memory_planning_info_for_scheduler_buffers(
+                self.nodes, self.name_to_buf
+            )
+
+        graph_outputs: OrderedSet[str] = OrderedSet(V.graph.get_output_names())
+        buf_info_list, _, _ = compute_memory_timeline(
+            self.nodes,
+            name_to_freeable_input_buf,
+            graph_outputs,
+        )
+
+        step_allocs_deallocs: list[tuple[list[str], list[str]]] = [
+            ([], []) for _ in range(len(self.nodes))
+        ]
+        for buf_info in buf_info_list:
+            # Skip zero-size buffers
+            if buf_info.size_alloc == 0 and buf_info.size_free == 0:
+                continue
+
+            buf_name = buf_info.buffer.get_name()
+
+            step_allocs_deallocs[buf_info.start_step][0].append(buf_name)
+            step_allocs_deallocs[buf_info.end_step][1].append(buf_name)
+
+        from torch._inductor.runtime.debug_utils import register_check_mem_op
+
+        register_check_mem_op()
+
+        def construct_mem_check_node(
+            step_idx: int, is_final_step: bool
+        ) -> ExternKernelSchedulerNode:
+            expected_newly_alive = step_allocs_deallocs[step_idx][0]
+            expected_newly_dead = step_allocs_deallocs[step_idx][1]
+
+            nontensor_args = [expected_newly_alive, expected_newly_dead, is_final_step]
+
+            node = ir.MemoryCheckKernel(
+                layout=NoneLayout(device=torch.device("cpu")),
+                kernel=torch.ops._inductor_debug.check_memory_step.default,
+                tensor_args=[],
+                nontensor_args=nontensor_args,
+                unflatten_args=lambda tensor_args, constant_args: (
+                    tensor_args,
+                    {
+                        "alive": constant_args[0],
+                        "dead": constant_args[1],
+                        "is_final_step": constant_args[2],
+                    },
+                ),
+            )
+            node.operation_name = f"mem_check_{self.nodes[step_idx].get_name()}"
+            return ExternKernelSchedulerNode(self, node)
+
+        new_nodes = []
+
+        for i, node in enumerate(self.nodes):
+            new_nodes.append(node)
+            new_nodes.append(
+                construct_mem_check_node(i, is_final_step=(i == len(self.nodes) - 1))
+            )
+
+        self.nodes = new_nodes
 
     def dead_node_elimination(self) -> None:
         """
@@ -2653,10 +2803,10 @@ class Scheduler:
             node.max_order = order
 
     def merge_loops(self) -> None:
-        for node in self.nodes:
-            if not config.loop_ordering_after_fusion:
-                continue
+        if not config.loop_ordering_after_fusion:
+            return
 
+        for node in self.nodes:
             # Even for CPU, if we are using the halide backend, we still need
             # the merge loops steps below
             if not isinstance(node, (SchedulerNode, FusedSchedulerNode)) or (
@@ -3767,12 +3917,109 @@ class Scheduler:
 
         return True
 
+    def get_expand_dim_for_pointwise_nodes(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> Optional[tuple[int, SchedulerNode, sympy.Expr]]:
+        """
+        Fusing two small pointwise nodes significantly reduces kernel overhead
+        and launch overhead. However, slightly different sizes would prevent fusion.
+        Here, we decide if expanding sizes of one node is profitible by allowing
+        fusion, and returns the dimension to expand, node with smaller sizes,
+        and new size after expand.
+        """
+        # only support scheduler node
+        if not isinstance(node1, SchedulerNode) or not isinstance(node2, SchedulerNode):
+            return None
+
+        # only support computued buffer
+        if not (
+            isinstance(node1.node, ir.ComputedBuffer)
+            and isinstance(node2.node, ir.ComputedBuffer)
+        ):
+            return None
+
+        # does not support mutation yet since relying on index mod to handle
+        # out-of-boundary access.
+        if node1.has_aliasing_or_mutation() or node2.has_aliasing_or_mutation():
+            return None
+
+        # skip halide which does not support mod for index
+        if config.cpu_backend == "halide":
+            return None
+
+        # only support pointwise nodes with the same reduction size
+        n1_sizes, n2_sizes = node1._sizes, node2._sizes
+        n1_iter_sizes, n1_reduce_sizes = n1_sizes
+        n2_iter_sizes, n2_reduce_sizes = n2_sizes
+        if (
+            node1.is_reduction()
+            or node2.is_reduction()
+            or n1_reduce_sizes != n2_reduce_sizes
+            or len(n1_iter_sizes) != len(n2_iter_sizes)
+        ):
+            return None
+
+        # only support nodes with 1 write for simplification
+        if len(node1.read_writes.writes) > 1 or len(node2.read_writes.writes) > 1:
+            return None
+
+        # When memory access is small, reducing gpu kernel overhead is profitable over
+        # slightly larger memory access.
+        node1_write_memory = self.dep_size_hint(next(iter(node1.read_writes.writes)))
+        node2_write_memory = self.dep_size_hint(next(iter(node1.read_writes.writes)))
+        if (
+            max(node1_write_memory, node2_write_memory)
+            > config.small_memory_access_threshold
+        ):
+            return None
+
+        # does not support reinplace since `index % boundary` may lead to
+        # race condition
+        def has_reusable_buffer(node: BaseSchedulerNode) -> bool:
+            for read in node.read_writes.reads:
+                input_buf: Optional[Union[SchedulerBuffer, SchedulerDonatedBuffer]]
+                if read.name in self.name_to_donated_buffer:
+                    input_buf = self.name_to_donated_buffer[read.name]
+                else:
+                    input_buf = self.name_to_buf.get(read.name)
+
+                if (
+                    input_buf
+                    and V.graph.wrapper_code.can_reuse(input_buf, node)
+                    and not isinstance(input_buf.defining_op, NopKernelSchedulerNode)
+                ):
+                    return True
+            return False
+
+        if has_reusable_buffer(node1) or has_reusable_buffer(node2):
+            return None
+
+        # only support nodes with 1 mismatch dimension
+        mismatch_dimensions = []
+        for idx, (n1_size, n2_size) in enumerate(zip(n1_iter_sizes, n2_iter_sizes)):
+            if n1_size != n2_size:
+                mismatch_dimensions.append(idx)
+
+        if len(mismatch_dimensions) != 1:
+            return None
+
+        mismatch_dim = mismatch_dimensions[0]
+        mismatch_size1, mismatch_size2 = (
+            n1_iter_sizes[mismatch_dim],
+            n2_iter_sizes[mismatch_dim],
+        )
+        if V.graph.sizevars.statically_known_lt(mismatch_size1, mismatch_size2):
+            return mismatch_dim, node1, mismatch_size2
+        elif V.graph.sizevars.statically_known_lt(mismatch_size2, mismatch_size1):
+            return mismatch_dim, node2, mismatch_size1
+        else:
+            return None
+
     def can_fuse(self, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> bool:
         """
         Determine if it is possible to combine node1 and node2 into a
         single fused node.
         """
-
         if node1 is node2:
             return False
 
@@ -3876,7 +4123,6 @@ class Scheduler:
         ):
             why("fusion for buffer explicit disabled")
             return False
-
         device = node1.get_device()
         device2 = node2.get_device()
         if device != device2:
@@ -3890,6 +4136,13 @@ class Scheduler:
             and config.loop_ordering_after_fusion
         ):
             shared_data_score = self.shared_data_after_reordering_loop(node1, node2)
+
+        if config.expand_dimension_for_pointwise_nodes and (
+            expand_analysis := self.get_expand_dim_for_pointwise_nodes(node1, node2)
+        ):
+            (expand_dim, smaller_node, expand_size) = expand_analysis
+            smaller_node.expand_dimension_for_pointwise_node(expand_dim, expand_size)
+            shared_data_score = self.score_fusion_memory(node1, node2)
 
         if loop_ordering_log.isEnabledFor(logging.DEBUG):
             loop_ordering_log.debug(
@@ -4230,6 +4483,15 @@ class Scheduler:
         self, node: BaseSchedulerNode, should_log: bool = False
     ) -> bool:
         """Return True if we should partition the inductor graph on this node"""
+
+        # When not using cudagraphs, keep all kernels in the `call` function
+        # instead of graph partition functions, since graph partition only brings
+        # benefit to cudagraph
+        if (
+            not torch._inductor.config.triton.cudagraphs
+            and _unstable_customized_partition_wrapper.wrapper is None
+        ):
+            return True
 
         # avoid duplicating logs when should_partition is called multiple times
         # on the same node
@@ -4888,6 +5150,7 @@ class Scheduler:
                         assert device.index is not None, "device should have an index"
                         V.graph.wrapper_code.codegen_device_guard_enter(device.index)
 
+            self.current_node = node
             self.buffer_names_to_free.update(node.last_usage)
 
             if node.is_template():

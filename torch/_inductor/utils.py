@@ -18,6 +18,7 @@ import re
 import shutil
 import statistics
 import sys
+import sysconfig
 import tempfile
 import textwrap
 import time
@@ -895,7 +896,15 @@ def gather_origins(
             return is_unrealized_node(n.data)
         if isinstance(n, ir.StorageBox):
             return is_unrealized_node(n.data)
-        return isinstance(n, ir.IRNode) and not ir.IRNode.is_realized_node(n)
+        return isinstance(n, ir.IRNode) and not isinstance(
+            n,
+            (
+                ir.ComputedBuffer,
+                ir.InputsKernel,
+                ir.InputBuffer,
+                ir.TemplateBuffer,
+            ),
+        )
 
     # kwargs and args may include a container of node, for example torch.cat([t1, t2])
     # flatten them before search the unrealized nodes
@@ -1552,12 +1561,26 @@ def is_big_gpu(index_or_device: Union[int, torch.device] = 0) -> bool:
 
 @functools.lru_cache
 def get_max_num_sms() -> int:
+    if torch.xpu.is_available():
+        return torch.xpu.get_device_properties().gpu_subslice_count
     return torch.cuda.get_device_properties("cuda").multi_processor_count
+
+
+@functools.lru_cache
+def using_b200() -> bool:
+    """Returns true if the device is a NVIDIA B200, otherwise returns false."""
+    if not torch.cuda.is_available():
+        return False
+    # compute capability 10.0 or 10.0a is NVIDIA B200
+    device_properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return device_properties.major == 10
 
 
 def get_num_sms() -> int:
     """Handle experimental carveout if set otherwise return hardware SM count"""
     # TODO we need to properly guard on this global
+    if torch.xpu.is_available():
+        return get_max_num_sms()
     carveout = torch._C._get_sm_carveout_experimental()
     return get_max_num_sms() - (carveout if carveout is not None else 0)
 
@@ -1611,7 +1634,11 @@ def _use_conv_autotune_backend(backend: str) -> bool:
 
 
 def use_triton_template(
-    layout: Layout, *, enable_int32: bool = False, enable_float8: bool = False
+    layout: Layout,
+    *,
+    enable_int32: bool = False,
+    enable_float8: bool = False,
+    check_max_autotune: bool = True,
 ) -> bool:
     from .codegen.common import BackendFeature, has_backend_feature
 
@@ -1628,7 +1655,8 @@ def use_triton_template(
             )
             or (layout.device.type == "cpu" and layout.dtype in layout_dtypes)
         )
-        and (config.max_autotune or config.max_autotune_gemm)
+        # some callers handle max-autotune checking externally
+        and (config.max_autotune or config.max_autotune_gemm or not check_max_autotune)
         and _use_autotune_backend("TRITON")
         and has_backend_feature(layout.device, BackendFeature.TRITON_TEMPLATES)
     )
@@ -1656,7 +1684,7 @@ def can_use_tma(*matrices: IRNode, add_guards: bool = False) -> bool:
     def _aligned(expr_bytes: Union[int, sympy.Expr]) -> bool:
         return V.graph.sizevars.statically_known_multiple_of(expr_bytes, TMA_ALIGNMENT)
 
-    def _is_tma_compatible(x: IRNode) -> bool:
+    def _is_tma_compatible_default(x: IRNode) -> bool:
         sizes = x.get_size()
         strides = x.get_stride()
         rank = len(sizes)
@@ -1716,12 +1744,31 @@ def can_use_tma(*matrices: IRNode, add_guards: bool = False) -> bool:
 
         return True
 
-    return has_triton_tma_device() and all(_is_tma_compatible(m) for m in matrices)
+    def _is_tma_compatible_xpu(x: IRNode) -> bool:
+        strides = x.get_stride()
+        strides_i = [V.graph.sizevars.symbolic_hint(st) for st in strides]
+        # Find the single contiguous (“inner”) dim
+        inner = [
+            i
+            for i, st in enumerate(strides_i)
+            if V.graph.sizevars.statically_known_equals(st, 1)
+        ]
+        if len(inner) != 1:
+            return False
+        return True
+
+    return has_triton_tma_device() and all(
+        _is_tma_compatible_default(m)
+        if (m_device := m.get_device()) is None or m_device.type != "xpu"
+        else _is_tma_compatible_xpu(m)
+        for m in matrices
+    )
 
 
 def use_triton_tma_template(*matrices: IRNode, add_guards: bool = False) -> bool:
     return (
-        can_use_tma(*matrices, add_guards=add_guards)
+        all(len(m.get_size()) == 2 for m in matrices)
+        and can_use_tma(*matrices, add_guards=add_guards)
         and config.triton.enable_persistent_tma_matmul
     )
 
@@ -1785,6 +1832,30 @@ def use_decompose_k_choice(m: _IntLike, n: _IntLike, k: _IntLike) -> bool:
             )
         )
         and not V.graph.aot_mode  # TODO: Support AOTI for decomposeK
+        and not V.graph.cpp_wrapper
+    )
+
+
+@functools.cache
+def use_contiguous(m: _IntLike, n: _IntLike, k: _IntLike) -> bool:
+    """
+    Check if we should use the contiguous subgraph transform.
+    This transform makes the second matrix contiguous before the matmul.
+    """
+    contiguous_threshold = config.rocm.contiguous_threshold
+
+    # Similar conditions to decompose_k but for contiguous transform
+    from torch._inductor.virtualized import V
+
+    return (
+        bool(torch.version.hip)  # Only relevant on AMD
+        and V.graph.sizevars.statically_known_true(
+            sympy.And(
+                sympy.Ge(k, contiguous_threshold * m),
+                sympy.Ge(k, contiguous_threshold * n),
+            )
+        )
+        and not V.graph.aot_mode
         and not V.graph.cpp_wrapper
     )
 
@@ -2967,6 +3038,26 @@ def expr_fits_within_32bit(e: sympy.Expr) -> bool:
     # (e.g., via ValueRanges) that it is still in bounds
     if V.graph.sizevars.statically_known_true(e <= int_max):
         return True
+
+    # AOTI doesn't guard on < 2**32, so checking hints isn't a viable option,
+    # in case the hinted value is < 2**32, but the allowed range is larger.
+    # However, to prevent possible perf regressions on pre-existing AOTI models
+    # which don't set an upper bound on the valid range, we'll skip the check.
+    # To recap:
+    # - If using AOTI:
+    #   - If allowed range has no upper bound, then check the hint to determine
+    #       whether this fits in int32
+    #   - If allowed range does have an upper bound, then obey the upper bound
+    #       (check whether upper bound < int32_max) without checking the hint.
+
+    if V.aot_compilation:
+        # check whether value has an upper bound (1e20 is > INT64_MAX, assume
+        # there is no upper bound if it can be larger than 1e20)
+        if V.graph.sizevars.statically_known_true(e < 1e20):
+            # if so, then assume int_max < upper bound < inf
+            # so this could potentially have int64 values
+            return False
+
     # Otherwise, the hint MUST exist and be in range
     return has_hint(e) and size_hint(e) <= int_max
 
@@ -3301,6 +3392,13 @@ def is_codegen_graph_partition_subgraph(wrapper: PythonWrapperCodegen) -> bool:
     )
 
 
+def is_using_cudagraph_partition() -> bool:
+    return (
+        torch._inductor.config.triton.cudagraphs
+        or _unstable_customized_partition_wrapper.wrapper is not None
+    ) and torch._inductor.config.graph_partition
+
+
 def dtype_from_size(size: int) -> torch.dtype:
     from .virtualized import V
 
@@ -3346,13 +3444,12 @@ def tabulate_2d(elements: Sequence[Sequence[T]], headers: Sequence[T]) -> str:
         for i, e in enumerate(row):
             widths[i] = max(widths[i], len(str(e)))
     lines = []
-    # Need nested {} for string formatting; ignore SET_LINTER here
-    lines.append("|".join(f" {h:{w}} " for h, w in zip(headers, widths)))  # noqa: set_linter
+    lines.append("|".join(f" {h:{w}} " for h, w in zip(headers, widths)))
     #              widths          whitespace      horizontal separators
     total_width = sum(widths) + (len(widths) * 2) + (len(widths) - 1)
     lines.append("-" * total_width)
     for row in elements:
-        lines.append("|".join(f" {e:{w}} " for e, w in zip(row, widths)))  # noqa: set_linter
+        lines.append("|".join(f" {e:{w}} " for e, w in zip(row, widths)))
     return "\n".join(lines)
 
 
@@ -3407,20 +3504,36 @@ def maybe_aoti_standalone_config(config_patches: dict[str, Any]) -> dict[str, An
     Returns:
         dict[str, Any]: The possibly-updated `config_patches` dictionary.
     """
+
+    def patch_config(
+        config_patches: dict[str, Any], config_name: str, config_value: Any
+    ) -> None:
+        value = config_patches.get(config_name, getattr(config, config_name))
+        if value is None:
+            config_patches[config_name] = config_value
+        elif not value and value != config_value:
+            raise RuntimeError(
+                f"Invalid config: {config_name}={config_value} when aot_inductor.compile_standalone is True."
+            )
+
     compile_standalone = config_patches.get(
         "aot_inductor.compile_standalone", config.aot_inductor.compile_standalone
     )
+    # Make a copy of the config_patches to avoid modifying the original dictionary, needed for testing
+    config_patches = config_patches.copy()
     if compile_standalone:
-        package_cpp_only = config_patches.get(
-            "aot_inductor.package_cpp_only", config.aot_inductor.package_cpp_only
+        # Standlaone AOTInductor means only generate cpp project for building a standalone binary
+        patch_config(config_patches, "aot_inductor.package_cpp_only", True)
+        # Standlaone AOTInductor needs to embed the kernel code in the binary
+        patch_config(config_patches, "aot_inductor.embed_kernel_binary", True)
+        # Default to use multi-arch kernel codegen for non-rocm GPU
+        patch_config(
+            config_patches, "aot_inductor.emit_multi_arch_kernel", not torch.version.hip
         )
-        if package_cpp_only is None:
-            config_patches = {**config_patches, "aot_inductor.package_cpp_only": True}
-        elif not package_cpp_only:
-            raise RuntimeError(
-                "compile_standalone=True requires package_cpp_only=True. "
-                "Please set aot_inductor.package_cpp_only=True in your inductor config."
-            )
+        patch_config(
+            config_patches, "aot_inductor.model_name_for_generated_files", "aoti_model"
+        )
+
     return config_patches
 
 
@@ -3449,14 +3562,6 @@ def is_valid_aoti_model_name() -> bool:
         )
 
     return True
-
-
-def aoti_model_name_from_config() -> str:
-    from torch._inductor import config
-
-    model_name = config.aot_inductor.model_name_for_generated_files
-    model_name = "aoti_model" if model_name is None else model_name
-    return model_name
 
 
 def get_free_symbols(x: IterateExprs, unbacked_only: bool) -> OrderedSet[sympy.Symbol]:
@@ -3489,3 +3594,75 @@ def maybe_log_cudagraph_partition(
         warning_msg = f"{warning_msg}. Found from : \n {stack_trace}"
 
     perf_hint_log.warning(warning_msg)
+
+
+def python_subprocess_env() -> dict[str, str]:
+    """
+    Get a base environment for running Python subprocesses.
+    """
+
+    env = {
+        # Inherit the environment of the current process.
+        **os.environ,
+        # Set the PYTHONPATH so the subprocess can find torch.
+        "PYTHONPATH": os.environ.get(
+            "TORCH_CUSTOM_PYTHONPATH", os.pathsep.join(sys.path)
+        ),
+    }
+
+    # Set PYTHONHOME for internal builds, to account for builds that bundle the
+    # runtime.  Otherwise they will use the libraries and headers from the
+    # platform runtime instead.
+    #
+    # This can't be done for external builds.  The process can be run from a
+    # venv and that won't include Python headers.  The process needs to be able
+    # to search for and find the platform runtime.
+    if config.is_fbcode():
+        env["PYTHONHOME"] = sysconfig.get_path("data")
+
+    return env
+
+
+@dataclasses.dataclass(frozen=True)
+class CUDAGraphWrapperMetadata:
+    """
+    Metadata for Customized CUDAGraphWrapper.
+
+    Currently assumes there is 1 dynamo graph and will extend to
+    multiple graphs in the future.
+    """
+
+    # The number of partitions that are cudagraphable.
+    num_partitions: int
+
+    # Index of the current partition.
+    partition_index: int
+
+
+PartitionFnType = Callable[..., Any]
+CUDAGraphWrapperType = Callable[
+    [PartitionFnType, CUDAGraphWrapperMetadata], PartitionFnType
+]
+
+
+# only incremented by user call of mark_step_begin
+class CUDAGraphWrapper:
+    wrapper: Optional[CUDAGraphWrapperType] = None
+
+
+# A customized partition wrappers from users. Interface should be:
+#
+# def wrapper(fn: PartitionFnType, metadata: CUDAGraphWrapperMetadata) -> PartitionFnType
+#
+# Inductor generates N wrapper functions for N partition functions, and mechanically wrap
+# each partition fn with the generated wrapper function. Users need to handle all details
+# such as static inputs, dynamic shapes, etc.
+# Users could customize the wrapper based on the metadata. One example is to have special
+# handle for the first and last wrapper function.
+#
+# Warning: This API is unstable and may change in the future.
+_unstable_customized_partition_wrapper = CUDAGraphWrapper()
+
+
+def set_customized_partition_wrappers(wrapper: CUDAGraphWrapperType) -> None:
+    _unstable_customized_partition_wrapper.wrapper = wrapper

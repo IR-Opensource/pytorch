@@ -6827,13 +6827,10 @@ utils_device.CURRENT_DEVICE == None""".split("\n"):
 
         self.assertTrue(guard_failure is not None)
         first_guard_failure = guard_failure[0].partition("\n")[0]
-        if torch._dynamo.config.assume_static_by_default:
-            self.assertIn(
-                """tensor 'x' size mismatch at index 0. expected 2, actual 5""",
-                first_guard_failure,
-            )
-        else:
-            self.assertIn("""x.size()[0] < 3""", first_guard_failure)
+        self.assertIn(
+            """tensor 'x' size mismatch at index 0. expected 2, actual 5""",
+            first_guard_failure,
+        )
 
     def test_guard_failure_fn2(self):
         def fn(x, y):
@@ -10527,7 +10524,7 @@ def ___make_guard_fn():
         expected_fqn = {
             "L__self___test_param": "test_param",
             "L__self___test_buf": "test_buf",
-            "getattr_L__self___foo_bar___0__": "foo_bar.0",
+            "L__self___foo_bar_0": "foo_bar.0",
             "L__self___foo_bar_test_param": "foo_bar.test_param",
             "L__self___foo_bar_test_buf": "foo_bar.test_buf",
         }
